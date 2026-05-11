@@ -428,6 +428,7 @@ async def jupiter_buy(session: aiohttp.ClientSession, mint: str, amount_usdc: fl
         f"{_JUP_BASE}/quote"
         f"?inputMint={USDC_MINT}&outputMint={mint}"
         f"&amount={amount_raw}&slippageBps={SLIPPAGE_BPS}"
+        f"&maxAccounts=20"
     )
     logger.info(f"jupiter_buy: quote {mint[:8]}… amount_raw={amount_raw} ({amount_usdc} USDC) slippage={SLIPPAGE_BPS}bps")
     quote = await _jup_quote(session, quote_url)
@@ -478,6 +479,7 @@ async def jupiter_sell(session: aiohttp.ClientSession, mint: str, qty_raw: int) 
         f"{_JUP_BASE}/quote"
         f"?inputMint={mint}&outputMint={USDC_MINT}"
         f"&amount={qty_raw}&slippageBps={SLIPPAGE_BPS}"
+        f"&maxAccounts=20"
     )
     logger.info(f"jupiter_sell: quote {mint[:8]}… qty_raw={qty_raw} slippage={SLIPPAGE_BPS}bps")
     quote = await _jup_quote(session, quote_url)
