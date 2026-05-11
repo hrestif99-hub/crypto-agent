@@ -12,6 +12,9 @@ import socket
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
+from dotenv import load_dotenv
+load_dotenv()
+
 # ─── Patch DNS (Railway / environnements sans résolution DNS système) ─────────
 _orig_getaddrinfo = socket.getaddrinfo
 def _patched_getaddrinfo(host, port, *args, **kwargs):
