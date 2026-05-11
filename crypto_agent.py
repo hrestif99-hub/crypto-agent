@@ -6,6 +6,7 @@ Crypto Signal Agent
 - Envoie une newsletter quotidienne par email
 """
 
+import os
 import requests
 import time
 import json
@@ -14,13 +15,17 @@ import schedule
 from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from config import (
-    TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
-    ANTHROPIC_API_KEY,
-    COINMARKETCAP_API_KEY,
-    EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_RECEIVER,
-    VOLUME_SPIKE_THRESHOLD, CHECK_INTERVAL_MINUTES, MARKET_CAP_MINIMUM
-)
+
+TELEGRAM_TOKEN          = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID        = int(os.environ.get("TELEGRAM_CHAT_ID", "0"))
+ANTHROPIC_API_KEY       = os.environ.get("ANTHROPIC_API_KEY", "")
+COINMARKETCAP_API_KEY   = os.environ.get("COINMARKETCAP_API_KEY", "")
+EMAIL_SENDER            = os.environ.get("EMAIL_SENDER", "")
+EMAIL_PASSWORD          = os.environ.get("EMAIL_PASSWORD", "")
+EMAIL_RECEIVER          = os.environ.get("EMAIL_RECEIVER", "")
+VOLUME_SPIKE_THRESHOLD  = float(os.environ.get("VOLUME_SPIKE_THRESHOLD", "0.3"))
+CHECK_INTERVAL_MINUTES  = int(os.environ.get("CHECK_INTERVAL_MINUTES", "15"))
+MARKET_CAP_MINIMUM      = int(os.environ.get("MARKET_CAP_MINIMUM", "50000000"))
 
 # ─── TELEGRAM ────────────────────────────────────────────────────────────────
 
