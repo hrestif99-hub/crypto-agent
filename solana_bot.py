@@ -67,7 +67,20 @@ SCAN_INTERVAL    = 60
 MONITOR_INTERVAL = 30
 PYRAMID_INTERVAL = 300
 
-CHANNELS         = ["pumping_sol", "solana_degens", "dexscreener_trending"]
+CHANNELS = [
+    "pumping_sol",
+    "solana_degens",
+    "dexscreener_trending",
+    "SOLScanTrendingCI",
+    "solanatrendingtoday",
+    "solearlytrending",
+    "memecoin_signals",
+    "bestsolanamemecoinscalls",
+    "ninjacallssolanamemecoin",
+    "solana_calls_memecoins",
+    "whale_alert_io",
+    "lookonchain"
+]
 SIGNAL_WINDOW    = 300   # 5 min
 SIGNAL_THRESHOLD = 3     # 3 canaux distincts
 
