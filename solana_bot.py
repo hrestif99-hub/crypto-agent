@@ -723,7 +723,7 @@ async def process_token(session: aiohttp.ClientSession, mint: str,
     score, reasons = compute_score(pair, pumpfun, gp, tg_bonus)
     logger.info(f"[score] {tag} {score}/100 — {reasons}")
 
-    if score < 30:
+    if score < 60:
         logger.info(f"[rejet] {tag} score insuffisant ({score}/100 < 65)")
         blacklist.add(mint); _save_state(); return
 
