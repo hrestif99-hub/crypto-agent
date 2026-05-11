@@ -38,6 +38,7 @@ TELEGRAM_API_ID     = os.environ.get("TELEGRAM_API_ID", "")
 TELEGRAM_API_HASH   = os.environ.get("TELEGRAM_API_HASH", "")
 TELEGRAM_TOKEN      = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID             = os.environ.get("CHAT_ID", "").strip()
+DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
 
 USDC_MINT      = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 USDC_DECIMALS  = 6
@@ -417,6 +418,9 @@ async def _jup_swap(session: aiohttp.ClientSession, payload: dict) -> dict | Non
 async def jupiter_buy(session: aiohttp.ClientSession, mint: str, amount_usdc: float) -> tuple[bool, str, int]:
     """Achète via USDC. Retourne (success, sig, quantity_raw)."""
     kp = get_keypair()
+    if DRY_RUN:
+        logger.info(f"[DRY RUN] Achat simulé : {amount_usdc} USDC de {mint[:8]}")
+        return True, "dry_run_sig", 1000000
     if not kp:
         return False, "keypair manquant", 0
     amount_raw = int(amount_usdc * 10**USDC_DECIMALS)  # 2.0 USDC → 2_000_000
@@ -465,6 +469,9 @@ async def jupiter_buy(session: aiohttp.ClientSession, mint: str, amount_usdc: fl
 async def jupiter_sell(session: aiohttp.ClientSession, mint: str, qty_raw: int) -> tuple[bool, str, float]:
     """Vend qty_raw tokens. Retourne (success, sig, usdc_received)."""
     kp = get_keypair()
+    if DRY_RUN:
+        logger.info(f"[DRY RUN] Vente simulée : {qty_raw} tokens de {mint[:8]}")
+        return True, "dry_run_sig", 2.0
     if not kp or qty_raw <= 0:
         return False, "keypair/qty manquant", 0.0
     quote_url = (
