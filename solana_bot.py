@@ -52,10 +52,8 @@ SLIPPAGE_BPS    = 1500      # 15%
 # Endpoints Jupiter testés au démarrage — le premier qui répond est utilisé
 _JUP_ENDPOINTS = [
     "https://api.jup.ag/swap/v1",
-    "https://jupiter-quote-api-node.jup.ag",
 ]
-_JUP_BASE: str = _JUP_ENDPOINTS[0]  # mis à jour par _init_jupiter_endpoint()
-
+_JUP_BASE: str = _JUP_ENDPOINTS[0]
 STOP_LOSS_PCT   = -30.0
 TP_HALF_PCT     = 50.0      # vendre 50% à +50%
 TP_FULL_PCT     = 100.0     # vendre 100% à +100%
@@ -893,11 +891,11 @@ async def auth_telethon():
 async def _init_jupiter_endpoint():
     global _JUP_BASE
     test_path = (
-        "/v6/quote"
-        "?inputMint=So11111111111111111111111111111111111111112"
-        "&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-        "&amount=1000000&slippageBps=50"
-    )
+    "/quote"
+    "?inputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+    "&outputMint=So11111111111111111111111111111111111111112"
+    "&amount=1000000&slippageBps=50"
+)
     async with aiohttp.ClientSession() as session:
         for base in _JUP_ENDPOINTS:
             try:
