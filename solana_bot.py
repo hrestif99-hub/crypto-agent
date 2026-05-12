@@ -2,6 +2,7 @@
 """Bot de trading autonome Solana memecoins — tourne en parallèle du bot Coinbase."""
 
 import asyncio
+import requests
 import aiohttp
 import os
 import json
@@ -537,8 +538,8 @@ async def jupiter_sell(session: aiohttp.ClientSession, mint: str, qty_raw: int) 
 
 
 # ─── Pump.fun fallback buy ────────────────────────────────────
-async def pump_buy(session: aiohttp.ClientSession, mint: str, amount_usdc: float) -> tuple[bool, str, int]:
-    """Achète via PumpPortal quand Jupiter n'a pas de route. Retourne (success, sig, qty_raw)."""
+async def pump_buy(session, mint: str, amount_usdc: float) -> tuple[bool, str, int]:
+    """Achète via PumpPortal Local Transaction API. Retourne (success, sig, qty_raw)."""
     if DRY_RUN:
         logger.info(f"[DRY RUN] Pump.fun achat simulé : {amount_usdc} USDC de {mint[:8]}")
         return True, "dry_run_sig", 1000000
@@ -546,42 +547,34 @@ async def pump_buy(session: aiohttp.ClientSession, mint: str, amount_usdc: float
     if not kp:
         return False, "keypair manquant", 0
     try:
-        async with session.post(
-            "https://pumpportal.fun/api/trade",
-            json={
-                "action":           "buy",
-                "mint":             mint,
-                "amount":           amount_usdc,
-                "denominatedInSol": "false",
-                "slippage":         15,
-                "priorityFee":      0.005,
-                "pool":             "pump",
-            },
-            timeout=aiohttp.ClientTimeout(total=20),
-        ) as r:
-            body = await r.text()
-            if r.status != 200:
-                logger.error(f"pump_buy: HTTP {r.status} — {body[:400]}")
-                return False, f"pump HTTP {r.status}", 0
-            data = json.loads(body)
-            if "transaction" not in data:
-                logger.error(f"pump_buy: transaction absente — {body[:400]}")
-                return False, "pump: transaction absente", 0
+        response = requests.post(url="https://pumpportal.fun/api/trade-local", data={
+            "publicKey":        str(kp.pubkey()),
+            "action":           "buy",
+            "mint":             mint,
+            "amount":           amount_usdc,
+            "denominatedInSol": "false",
+            "slippage":         15,
+            "priorityFee":      0.005,
+            "pool":             "auto",
+        })
+        if response.status_code != 200:
+            logger.error(f"pump_buy: HTTP {response.status_code} — {response.text[:200]}")
+            return False, f"pump HTTP {response.status_code}", 0
         from solders.transaction import VersionedTransaction
-        from solana.rpc.async_api import AsyncClient
-        raw    = base64.b64decode(data["transaction"])
-        tx     = VersionedTransaction.from_bytes(raw)
-        signed = VersionedTransaction(tx.message, [kp])
-        async with AsyncClient(HELIUS_RPC_URL) as client:
-            result = await asyncio.wait_for(
-                client.send_raw_transaction(bytes(signed)), timeout=30
-            )
-        sig = str(result.value)
+        from solders.commitment_config import CommitmentLevel
+        from solders.rpc.requests import SendVersionedTransaction
+        from solders.rpc.config import RpcSendTransactionConfig
+        tx = VersionedTransaction(VersionedTransaction.from_bytes(response.content).message, [kp])
+        commitment = CommitmentLevel.Confirmed
+        config = RpcSendTransactionConfig(preflight_commitment=commitment)
+        rpc_response = requests.post(
+            url=HELIUS_RPC_URL,
+            headers={"Content-Type": "application/json"},
+            data=SendVersionedTransaction(tx, config).to_json(),
+        )
+        sig = rpc_response.json()["result"]
         logger.info(f"pump_buy {mint[:8]} sig={sig[:12]}")
         return True, sig, 1000000
-    except asyncio.TimeoutError:
-        logger.error(f"pump_buy: timeout ({mint[:8]})")
-        return False, "timeout", 0
     except Exception as e:
         logger.error(f"pump_buy: {e}")
         return False, str(e), 0
