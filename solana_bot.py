@@ -92,7 +92,7 @@ logger = logging.getLogger("solana_bot")
 
 # ─── État global ──────────────────────────────────────────────
 positions    = {}   # mint -> dict
-blacklist    = set()
+blacklist    = {}   # mint -> datetime d'expiration
 tg_mentions  = defaultdict(lambda: defaultdict(list))  # mint -> channel -> [datetime]
 
 POSITIONS_FILE = "solana_positions.json"
@@ -106,14 +106,20 @@ def _load_state():
             positions = json.load(f)
     if os.path.exists(BLACKLIST_FILE):
         with open(BLACKLIST_FILE) as f:
-            blacklist = set(json.load(f))
+            raw = json.load(f)
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            blacklist = {
+                mint: datetime.fromisoformat(exp)
+                for mint, exp in raw.items()
+                if datetime.fromisoformat(exp) > now
+            }
 
 
 def _save_state():
     with open(POSITIONS_FILE, "w") as f:
         json.dump(positions, f, indent=2, default=str)
     with open(BLACKLIST_FILE, "w") as f:
-        json.dump(list(blacklist), f)
+        json.dump({mint: exp.isoformat() for mint, exp in blacklist.items()}, f)
 
 
 # ─── Keypair Solana ───────────────────────────────────────────
@@ -612,7 +618,7 @@ def open_pos(mint: str, symbol: str, amount_usdc: float, entry_price: float,
 def close_pos(mint: str):
     if mint in positions:
         del positions[mint]
-    blacklist.add(mint)
+    blacklist[mint] = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=15)
     _save_state()
 
 
@@ -747,7 +753,7 @@ def has_tg_signal(mint: str) -> bool:
 # ─── Traitement d'un token candidat ─────────────────────────
 async def process_token(session: aiohttp.ClientSession, mint: str,
                         symbol: str, pumpfun: dict | None):
-    if mint in blacklist or mint in positions:
+    if (mint in blacklist and datetime.now(timezone.utc).replace(tzinfo=None) < blacklist[mint]) or mint in positions:
         return
 
     tag = f"{symbol} ({mint[:8]}…)"
@@ -766,13 +772,13 @@ async def process_token(session: aiohttp.ClientSession, mint: str,
     # Filtres d'entrée — loggés individuellement pour diagnostic
     if age_min > 40:
         logger.debug(f"[rejet] {tag} trop vieux ({age_min:.1f}min > 10min)")
-        blacklist.add(mint); _save_state(); return
+        blacklist[mint] = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=15); _save_state(); return
     if liq < 5_000:
         logger.debug(f"[rejet] {tag} liquidité trop basse (${liq:,.0f} < $5 000)")
-        blacklist.add(mint); _save_state(); return
+        blacklist[mint] = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=15); _save_state(); return
     if vol5 < 1_000 and not has_tg_signal(mint):
         logger.debug(f"[rejet] {tag} volume 5min trop bas (${vol5:,.0f} < $1 000, pas de signal TG)")
-        blacklist.add(mint); _save_state(); return
+        blacklist[mint] = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=15); _save_state(); return
 
     logger.info(f"[candidat] {tag} age={age_min:.1f}min liq=${liq:,.0f} vol5m=${vol5:,.0f}")
 
@@ -781,7 +787,7 @@ async def process_token(session: aiohttp.ClientSession, mint: str,
         flags = goplus_red_flags(gp)
         if flags:
             logger.info(f"[rejet] {tag} GoPlus flags={flags}")
-            blacklist.add(mint); _save_state(); return
+            blacklist[mint] = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=15); _save_state(); return
 
     tg_bonus = has_tg_signal(mint)
     score, reasons = compute_score(pair, pumpfun, gp, tg_bonus)
@@ -789,7 +795,7 @@ async def process_token(session: aiohttp.ClientSession, mint: str,
 
     if score < 60:
         logger.info(f"[rejet] {tag} score insuffisant ({score}/100 < 65)")
-        blacklist.add(mint); _save_state(); return
+        blacklist[mint] = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=15); _save_state(); return
 
     if len(positions) >= MAX_POSITIONS:
         logger.info(f"[rejet] {tag} max positions atteint ({MAX_POSITIONS})")
@@ -809,7 +815,7 @@ async def process_token(session: aiohttp.ClientSession, mint: str,
     ok, sig, qty_raw = await jupiter_buy(session, mint, TRADE_USDC)
     if not ok or qty_raw == 0:
         logger.error(f"[achat échoué] {tag} sig={sig}")
-        blacklist.add(mint); _save_state(); return
+        blacklist[mint] = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=15); _save_state(); return
 
     entry_price = float((pair or {}).get("priceUsd", 0) or 0)
     if entry_price <= 0:
@@ -946,7 +952,7 @@ async def telethon_loop():
 async def watchdog_loop():
     while True:
         logger.info(
-            f"[watchdog] bot alive — positions={len(positions)} blacklist={len(blacklist)}"
+            f"[watchdog] bot alive — positions={len(positions)} blacklist={sum(1 for exp in blacklist.values() if datetime.now(timezone.utc).replace(tzinfo=None) < exp)}"
         )
         await asyncio.sleep(60)
 
