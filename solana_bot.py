@@ -585,7 +585,11 @@ async def pump_buy(session, mint: str, amount_usdc: float) -> tuple[bool, str, i
             headers={"Content-Type": "application/json"},
             data=SendVersionedTransaction(tx, config).to_json(),
         )
-        sig = rpc_response.json()["result"]
+        rpc_json = rpc_response.json()
+        if "result" not in rpc_json:
+            logger.error(f"pump_buy RPC erreur: {rpc_json}")
+            return False, f"RPC erreur: {rpc_json.get('error', rpc_json)}", 0
+        sig = rpc_json["result"]
         logger.info(f"pump_buy {mint[:8]} sig={sig[:12]}")
         return True, sig, 1000000
     except Exception as e:
