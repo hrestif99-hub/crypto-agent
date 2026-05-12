@@ -44,7 +44,7 @@ DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
 USDC_MINT      = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 USDC_DECIMALS  = 6
 
-TRADE_USDC      = 2.0
+TRADE_USDC      = 5.0
 PYRAMID_USDC    = 1.0
 MAX_POSITIONS   = 5
 MAX_TOTAL_USDC  = 10.0
@@ -310,46 +310,32 @@ async def fetch_pumpfun_new(session: aiohttp.ClientSession) -> list[dict]:
     return result
 
 
-# ─── GoPlus ──────────────────────────────────────────────────
-async def check_goplus(session: aiohttp.ClientSession, mint: str):
-    url = f"https://api.gopluslabs.io/api/v1/solana/token_security?contract_addresses={mint}"
-    data = await fetch_json(session, url)
-    if not data:
+# ─── RugCheck ────────────────────────────────────────────────
+async def check_rugcheck(session, mint: str):
+    url = f"https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary"
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status != 200:
+                return None
+            return await r.json(content_type=None)
+    except Exception as e:
+        logger.debug(f"rugcheck {mint[:8]}: {e}")
         return None
-    result = data.get("result", {})
-    return result.get(mint) or result.get(mint.lower())
 
 
-def goplus_red_flags(gp: dict) -> list[str]:
-    if not gp:
-        return []
-    flags = []
-    if str(gp.get("is_honeypot", "0")) == "1":
-        flags.append("honeypot")
-    sell_tax = float(gp.get("sell_tax", 0) or 0)
-    if sell_tax > 10:
-        flags.append(f"sell_tax={sell_tax:.0f}%")
-    if str(gp.get("is_mintable", "0")) == "1" or gp.get("mint_authority"):
-        flags.append("mintable")
-    top10 = float(gp.get("top_10_holder_rate", 0) or 0)
-    if top10 > 0.5:
-        flags.append(f"top10={top10*100:.0f}%")
-    return flags
-
-
-def goplus_minor_flags(gp: dict) -> int:
-    if not gp:
-        return 0
-    count = 0
-    if gp.get("freeze_authority"):
-        count += 1
-    if str(gp.get("can_take_back_ownership", "0")) == "1":
-        count += 1
-    return count
+def rugcheck_is_safe(report) -> bool:
+    if not report:
+        return True
+    score = report.get("score", 0)
+    risks = report.get("risks", [])
+    for risk in risks:
+        if risk.get("level") in ("danger", "critical"):
+            return False
+    return score < 500
 
 
 # ─── Scoring ─────────────────────────────────────────────────
-def compute_score(pair, pumpfun: dict | None, gp, tg_bonus: bool) -> tuple[int, str]:
+def compute_score(pair, pumpfun: dict | None, report, tg_bonus: bool) -> tuple[int, str]:
     score = 0
     parts = []
 
@@ -378,22 +364,17 @@ def compute_score(pair, pumpfun: dict | None, gp, tg_bonus: bool) -> tuple[int, 
     elif age_min < 10: score += 8;  parts.append(f"Age {age_min:.1f}min(+8)")
     elif age_min < 15: score += 5;  parts.append(f"Age {age_min:.1f}min(+5)")
 
-    holders = int((gp or {}).get("holder_count", 0) or 0)
-    if holders > 500:   score += 15; parts.append(f"Holders {holders}(+15)")
-    elif holders > 200: score += 10; parts.append(f"Holders {holders}(+10)")
-    elif holders > 100: score += 5;  parts.append(f"Holders {holders}(+5)")
-
     price5 = float((pair.get("priceChange") or {}).get("m5", 0) or 0) if pair else 0.0
     if price5 > 20:   score += 15; parts.append(f"+{price5:.0f}%/5min(+15)")
     elif price5 > 10: score += 10; parts.append(f"+{price5:.0f}%/5min(+10)")
     elif price5 > 5:  score += 5;  parts.append(f"+{price5:.0f}%/5min(+5)")
 
-    if gp is None:
-        score += 5; parts.append("GoPlus N/A(+5)")
-    elif goplus_minor_flags(gp) == 0:
-        score += 15; parts.append("GoPlus clean(+15)")
+    if report is None:
+        score += 5; parts.append("RugCheck N/A(+5)")
+    elif rugcheck_is_safe(report):
+        score += 15; parts.append("RugCheck safe(+15)")
     else:
-        score += 5; parts.append("GoPlus mineur(+5)")
+        score += 0
 
 
     return score, " | ".join(parts)
@@ -792,15 +773,13 @@ async def process_token(session: aiohttp.ClientSession, mint: str,
 
     logger.info(f"[candidat] {tag} age={age_min:.1f}min liq=${liq:,.0f} vol5m=${vol5:,.0f}")
 
-    gp = await check_goplus(session, mint)
-    if gp:
-        flags = goplus_red_flags(gp)
-        if flags:
-            logger.info(f"[rejet] {tag} GoPlus flags={flags}")
-            blacklist[mint] = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=15); _save_state(); return
+    report = await check_rugcheck(session, mint)
+    if not rugcheck_is_safe(report):
+        logger.info(f"[rejet] {tag} RugCheck dangereux")
+        blacklist[mint] = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=15); _save_state(); return
 
     tg_bonus = has_tg_signal(mint)
-    score, reasons = compute_score(pair, pumpfun, gp, tg_bonus)
+    score, reasons = compute_score(pair, pumpfun, report, tg_bonus)
     logger.info(f"[score] {tag} {score}/100 — {reasons}")
 
     if score < 50:
