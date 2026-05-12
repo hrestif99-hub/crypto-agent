@@ -103,16 +103,23 @@ def _load_state():
     global positions, blacklist
     if os.path.exists(POSITIONS_FILE):
         with open(POSITIONS_FILE) as f:
-            positions = json.load(f)
+            data = json.load(f)
+            if isinstance(data, dict):
+                positions = data
+            else:
+                positions = {}
     if os.path.exists(BLACKLIST_FILE):
         with open(BLACKLIST_FILE) as f:
             raw = json.load(f)
             now = datetime.now(timezone.utc).replace(tzinfo=None)
-            blacklist = {
-                mint: datetime.fromisoformat(exp)
-                for mint, exp in raw.items()
-                if datetime.fromisoformat(exp) > now
-            }
+            if isinstance(raw, dict):
+                blacklist = {
+                    mint: datetime.fromisoformat(exp)
+                    for mint, exp in raw.items()
+                    if datetime.fromisoformat(exp) > now
+                }
+            else:
+                blacklist = {}
 
 
 def _save_state():
