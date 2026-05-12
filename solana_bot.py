@@ -373,9 +373,10 @@ def compute_score(pair, pumpfun: dict | None, gp, tg_bonus: bool) -> tuple[int, 
         cat = pair.get("pairCreatedAt", 0)
         if cat:
             age_min = (datetime.now(timezone.utc).replace(tzinfo=None) - datetime.fromtimestamp(cat / 1000, timezone.utc).replace(tzinfo=None)).total_seconds() / 60
-    if age_min < 10:    score += 5; parts.append(f"Age {age_min:.1f}min(+15)")
-    elif age_min < 20:  score += 10; parts.append(f"Age {age_min:.1f}min(+10)")
-    elif age_min < 40: score += 15;  parts.append(f"Age {age_min:.1f}min(+5)")
+    if age_min < 2:    score += 15; parts.append(f"Age {age_min:.1f}min(+15)")
+    elif age_min < 5:  score += 12; parts.append(f"Age {age_min:.1f}min(+12)")
+    elif age_min < 10: score += 8;  parts.append(f"Age {age_min:.1f}min(+8)")
+    elif age_min < 15: score += 5;  parts.append(f"Age {age_min:.1f}min(+5)")
 
     holders = int((gp or {}).get("holder_count", 0) or 0)
     if holders > 500:   score += 15; parts.append(f"Holders {holders}(+15)")
@@ -394,8 +395,6 @@ def compute_score(pair, pumpfun: dict | None, gp, tg_bonus: bool) -> tuple[int, 
     else:
         score += 5; parts.append("GoPlus mineur(+5)")
 
-    if tg_bonus:
-        score += 15; parts.append("TG 3 canaux(+15)")
 
     return score, " | ".join(parts)
 
@@ -567,7 +566,7 @@ async def pump_buy(session, mint: str, amount_usdc: float) -> tuple[bool, str, i
             "amount":           amount_usdc,
             "denominatedInSol": "false",
             "slippage":         15,
-            "priorityFee":      0.005,
+            "priorityFee":      0.01,
             "pool":             "auto",
         })
         if response.status_code != 200:
@@ -781,8 +780,8 @@ async def process_token(session: aiohttp.ClientSession, mint: str,
             age_min = (datetime.now(timezone.utc).replace(tzinfo=None) - datetime.fromtimestamp(cat / 1000, timezone.utc).replace(tzinfo=None)).total_seconds() / 60
 
     # Filtres d'entrée — loggés individuellement pour diagnostic
-    if age_min > 40:
-        logger.debug(f"[rejet] {tag} trop vieux ({age_min:.1f}min > 10min)")
+    if age_min > 15:
+        logger.debug(f"[rejet] {tag} trop vieux ({age_min:.1f}min > 15min)")
         blacklist[mint] = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=15); _save_state(); return
     if liq < 5_000:
         logger.debug(f"[rejet] {tag} liquidité trop basse (${liq:,.0f} < $5 000)")
@@ -804,8 +803,8 @@ async def process_token(session: aiohttp.ClientSession, mint: str,
     score, reasons = compute_score(pair, pumpfun, gp, tg_bonus)
     logger.info(f"[score] {tag} {score}/100 — {reasons}")
 
-    if score < 60:
-        logger.info(f"[rejet] {tag} score insuffisant ({score}/100 < 65)")
+    if score < 50:
+        logger.info(f"[rejet] {tag} score insuffisant ({score}/100 < 50)")
         blacklist[mint] = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=15); _save_state(); return
 
     if len(positions) >= MAX_POSITIONS:
@@ -892,7 +891,8 @@ async def pyramid_loop():
         try:
             async with aiohttp.ClientSession() as session:
                 for mint in list(positions.keys()):
-                    await check_pyramid(session, mint)
+                    # pyramiding désactivé
+                    # await check_pyramid(session, mint)
                     await asyncio.sleep(1)
         except Exception as e:
             logger.error(f"pyramid_loop: {e}")
