@@ -46,13 +46,14 @@ USDC_DECIMALS  = 6
 
 TRADE_USDC      = 5.0
 PYRAMID_USDC    = 1.0
-MAX_POSITIONS   = 5
-MAX_TOTAL_USDC  = 10.0
-MIN_USDC        = 2.0
+MAX_POSITIONS   = 4
+MAX_TOTAL_USDC  = 20.0
+MIN_USDC        = 6.0
 MAX_PYRAMIDS    = 3
 PYRAMID_COOL    = 30 * 60   # 30 min
 PYRAMID_TRIGGER = 30.0      # +30%
-SLIPPAGE_BPS    = 1500      # 15%
+SLIPPAGE_BPS      = 1500      # 15%
+JITO_TIP_LAMPORTS = int(os.environ.get("JITO_TIP_LAMPORTS", "100000"))  # 0.0001 SOL par tx
 
 # Endpoints Jupiter testés au démarrage — le premier qui répond est utilisé
 _JUP_ENDPOINTS = [
@@ -64,7 +65,7 @@ TP_HALF_PCT     = 50.0      # vendre 50% à +50%
 TP_FULL_PCT     = 100.0     # vendre 100% à +100%
 TRAILING_PCT    = 25.0      # trailing -25% depuis le pic (actif si pic >= +50%)
 
-SCAN_INTERVAL    = 60
+SCAN_INTERVAL    = 20
 MONITOR_INTERVAL = 30
 PYRAMID_INTERVAL = 300
 
@@ -450,9 +451,10 @@ async def jupiter_buy(session: aiohttp.ClientSession, mint: str, amount_usdc: fl
         logger.error(f"jupiter_buy: erreur Jupiter quote: {quote['error']}")
         return False, f"quote error: {quote['error']}", 0
     swap = await _jup_swap(session, {
-        "quoteResponse":    quote,
-        "userPublicKey":    str(kp.pubkey()),
-        "wrapAndUnwrapSol": True,
+        "quoteResponse":      quote,
+        "userPublicKey":      str(kp.pubkey()),
+        "wrapAndUnwrapSol":   True,
+        "jitoTipLamports":    JITO_TIP_LAMPORTS,
     })
     if not swap or "swapTransaction" not in swap:
         logger.error(f"jupiter_buy: swapTransaction absent — réponse: {swap}")
@@ -501,9 +503,10 @@ async def jupiter_sell(session: aiohttp.ClientSession, mint: str, qty_raw: int) 
         logger.error(f"jupiter_sell: erreur Jupiter quote: {quote['error']}")
         return False, f"quote error: {quote['error']}", 0.0
     swap = await _jup_swap(session, {
-        "quoteResponse":    quote,
-        "userPublicKey":    str(kp.pubkey()),
-        "wrapAndUnwrapSol": True,
+        "quoteResponse":      quote,
+        "userPublicKey":      str(kp.pubkey()),
+        "wrapAndUnwrapSol":   True,
+        "jitoTipLamports":    JITO_TIP_LAMPORTS,
     })
     if not swap or "swapTransaction" not in swap:
         logger.error(f"jupiter_sell: swapTransaction absent — réponse: {swap}")
@@ -938,6 +941,48 @@ async def telethon_loop():
         await asyncio.sleep(30)
 
 
+# ─── Pump.fun WebSocket (détection instantanée) ──────────────
+async def pumpfun_ws_loop():
+    import websockets
+    uri = "wss://frontend-api.pump.fun/"
+    while True:
+        try:
+            async with websockets.connect(uri, ping_interval=20) as ws:
+                await ws.send(json.dumps({"method": "subscribeNewToken"}))
+                logger.info("pumpfun_ws: connecté — écoute nouveaux tokens en temps réel")
+                async with aiohttp.ClientSession() as session:
+                    async for raw_msg in ws:
+                        try:
+                            data = json.loads(raw_msg)
+                            mint   = data.get("mint")
+                            symbol = data.get("symbol", "?")
+                            if not mint:
+                                continue
+                            now = datetime.now(timezone.utc).replace(tzinfo=None)
+                            ts  = data.get("created_timestamp", 0)
+                            age_min = 0.0
+                            if ts:
+                                created = datetime.fromtimestamp(
+                                    ts / 1000 if ts > 1e10 else ts, timezone.utc
+                                ).replace(tzinfo=None)
+                                age_min = (now - created).total_seconds() / 60
+                            pumpfun_meta = {
+                                "address":    mint,
+                                "symbol":     symbol,
+                                "age_min":    age_min,
+                                "market_cap": float(data.get("usd_market_cap", 0) or 0),
+                                "source":     "pumpfun_ws",
+                            }
+                            asyncio.ensure_future(
+                                process_token(session, mint, symbol, pumpfun_meta)
+                            )
+                        except Exception as e:
+                            logger.error(f"pumpfun_ws message: {e}")
+        except Exception as e:
+            logger.error(f"pumpfun_ws déconnecté: {e} — reconnexion dans 5s")
+            await asyncio.sleep(5)
+
+
 # ─── Watchdog ────────────────────────────────────────────────
 async def watchdog_loop():
     while True:
@@ -1003,6 +1048,7 @@ async def main():
         pyramid_loop(),
         telethon_loop(),
         watchdog_loop(),
+        pumpfun_ws_loop(),
     )
 
 
