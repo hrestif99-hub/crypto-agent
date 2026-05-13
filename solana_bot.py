@@ -61,8 +61,8 @@ _JUP_ENDPOINTS = [
 ]
 _JUP_BASE: str = _JUP_ENDPOINTS[0]
 STOP_LOSS_PCT   = -10.0
-TP_HALF_PCT     = 10.0      # vendre 50% à +10%
-TP_FULL_PCT     = 25.0      # vendre 100% à +25%
+TP_HALF_PCT     = 30.0      # vendre 50% à +30%
+TP_FULL_PCT     = 80.0      # vendre 100% à +80%
 TRAILING_PCT    = 7.0       # trailing -7% depuis le pic (actif si pic >= +5%)
 
 SCAN_INTERVAL    = 20
@@ -949,8 +949,8 @@ async def process_token(session: aiohttp.ClientSession, mint: str,
     if age_min > 15:
         logger.debug(f"[rejet] {tag} trop vieux ({age_min:.1f}min > 15min)")
         blacklist[mint] = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=15); _save_state(); return
-    if liq < 5_000:
-        logger.debug(f"[rejet] {tag} liquidité trop basse (${liq:,.0f} < $5 000)")
+    if liq < 30_000:
+        logger.debug(f"[rejet] {tag} liquidité trop basse (${liq:,.0f} < $30 000)")
         blacklist[mint] = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=15); _save_state(); return
     if vol5 < 1_000 and not has_tg_signal(mint):
         logger.debug(f"[rejet] {tag} volume 5min trop bas (${vol5:,.0f} < $1 000, pas de signal TG)")
@@ -967,8 +967,8 @@ async def process_token(session: aiohttp.ClientSession, mint: str,
     score, reasons = compute_score(pair, pumpfun, report, tg_bonus)
     logger.info(f"[score] {tag} {score}/100 — {reasons}")
 
-    if score < 50:
-        logger.info(f"[rejet] {tag} score insuffisant ({score}/100 < 50)")
+    if score < 65:
+        logger.info(f"[rejet] {tag} score insuffisant ({score}/100 < 65)")
         blacklist[mint] = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=15); _save_state(); return
 
     if len(positions) >= MAX_POSITIONS:
