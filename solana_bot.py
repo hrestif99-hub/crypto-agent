@@ -39,7 +39,8 @@ TELEGRAM_API_ID     = os.environ.get("TELEGRAM_API_ID", "")
 TELEGRAM_API_HASH   = os.environ.get("TELEGRAM_API_HASH", "")
 TELEGRAM_TOKEN      = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID             = os.environ.get("CHAT_ID", "").strip()
-DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
+DRY_RUN    = os.environ.get("DRY_RUN",    "false").lower() == "true"
+PAPER_MODE = os.environ.get("PAPER_MODE", "false").lower() == "true"
 
 USDC_MINT      = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 USDC_DECIMALS  = 6
@@ -95,6 +96,13 @@ logger = logging.getLogger("solana_bot")
 positions    = {}   # mint -> dict
 blacklist    = {}   # mint -> datetime d'expiration
 tg_mentions  = defaultdict(lambda: defaultdict(list))  # mint -> channel -> [datetime]
+paper_state  = {
+    "usdc_balance":    200.0,
+    "initial_balance": 200.0,
+    "total_trades":    0,
+    "wins":            0,
+    "total_pnl":       0.0,
+}
 
 POSITIONS_FILE = "/root/solana_positions.json"
 BLACKLIST_FILE  = "/root/solana_blacklist.json"
@@ -181,6 +189,8 @@ async def post_json(session: aiohttp.ClientSession, url: str, payload: dict):
 
 # ─── Telegram ────────────────────────────────────────────────
 async def send_tg(text: str):
+    if PAPER_MODE:
+        text = "📄 PAPER | " + text
     if not TELEGRAM_TOKEN or not CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -431,6 +441,24 @@ async def _jup_swap(session: aiohttp.ClientSession, payload: dict) -> dict | Non
 # ─── Jupiter buy/sell ─────────────────────────────────────────
 async def jupiter_buy(session: aiohttp.ClientSession, mint: str, amount_usdc: float) -> tuple[bool, str, int]:
     """Achète via USDC. Retourne (success, sig, quantity_raw)."""
+    if PAPER_MODE:
+        amount_raw = int(amount_usdc * 10**USDC_DECIMALS)
+        quote_url = (
+            f"{_JUP_BASE}/quote"
+            f"?inputMint={USDC_MINT}&outputMint={mint}"
+            f"&amount={amount_raw}&slippageBps={SLIPPAGE_BPS}&maxAccounts=20"
+        )
+        quote = await _jup_quote(session, quote_url)
+        if isinstance(quote, dict) and "outAmount" in quote:
+            qty_raw = int(quote["outAmount"])
+        else:
+            price = await get_token_price_usd(session, mint)
+            if price <= 0:
+                return False, "paper: prix indisponible", 0
+            qty_raw = int(amount_usdc / price * 1e6)
+        paper_state["usdc_balance"] -= amount_usdc
+        logger.info(f"[PAPER] BUY {mint[:8]} qty={qty_raw} solde={paper_state['usdc_balance']:.2f}")
+        return True, "paper_sig", qty_raw
     kp = get_keypair()
     if DRY_RUN:
         logger.info(f"[DRY RUN] Achat simulé : {amount_usdc} USDC de {mint[:8]}")
@@ -677,6 +705,26 @@ async def smart_sell(
     opened_at: str,
 ) -> tuple[bool, str, float]:
     """Vente avec fallback progressif. Retourne (success, sig, usdc)."""
+    if PAPER_MODE:
+        quote_url = (
+            f"{_JUP_BASE}/quote"
+            f"?inputMint={mint}&outputMint={USDC_MINT}"
+            f"&amount={qty_raw}&slippageBps={SLIPPAGE_BPS}&maxAccounts=20"
+        )
+        quote = await _jup_quote(session, quote_url)
+        if isinstance(quote, dict) and "outAmount" in quote:
+            usdc_received = int(quote["outAmount"]) / 10**USDC_DECIMALS
+        else:
+            pos     = positions.get(mint, {})
+            entry   = pos.get("entry_price", 0)
+            current = await get_token_price_usd(session, mint)
+            if entry <= 0 or current <= 0:
+                return False, "paper: données manquantes", 0.0
+            total_qty     = pos.get("qty_raw", qty_raw) or qty_raw
+            usdc_received = (qty_raw / total_qty) * pos.get("amount_usdc", 0) * (current / entry)
+        paper_state["usdc_balance"] += usdc_received
+        logger.info(f"[PAPER] SELL {mint[:8]} qty={qty_raw} usdc=+{usdc_received:.2f} solde={paper_state['usdc_balance']:.2f}")
+        return True, "paper_sig", usdc_received
     is_pump = mint.endswith("pump")
     kp = get_keypair()
     if not kp:
@@ -842,6 +890,11 @@ async def check_position(session: aiohttp.ClientSession, mint: str):
         ok, sig, usdc = await smart_sell(session, mint, qty, symbol, pct_e, opened_at)
         if ok:
             pnl = usdc - pos["amount_usdc"]
+            if PAPER_MODE:
+                paper_state["total_trades"] += 1
+                paper_state["total_pnl"]    += pnl
+                if pnl > 0:
+                    paper_state["wins"] += 1
             await send_tg(
                 f"SOLANA VENTE TOTALE\n\n"
                 f"Token  : {symbol}\n"
@@ -858,6 +911,11 @@ async def check_position(session: aiohttp.ClientSession, mint: str):
         ok, sig, usdc = await smart_sell(session, mint, qty, symbol, pct_e, opened_at)
         if ok:
             pnl = usdc - pos["amount_usdc"]
+            if PAPER_MODE:
+                paper_state["total_trades"] += 1
+                paper_state["total_pnl"]    += pnl
+                if pnl > 0:
+                    paper_state["wins"] += 1
             await send_tg(
                 f"SOLANA TRAILING STOP\n\n"
                 f"Token  : {symbol}\n"
@@ -873,6 +931,11 @@ async def check_position(session: aiohttp.ClientSession, mint: str):
         ok, sig, usdc = await smart_sell(session, mint, qty, symbol, pct_e, opened_at)
         if ok:
             pnl = usdc - pos["amount_usdc"]
+            if PAPER_MODE:
+                paper_state["total_trades"] += 1
+                paper_state["total_pnl"]    += pnl
+                if pnl > 0:
+                    paper_state["wins"] += 1
             await send_tg(
                 f"SOLANA STOP LOSS\n\n"
                 f"Token  : {symbol}\n"
@@ -1165,6 +1228,70 @@ async def pumpfun_ws_loop():
             await asyncio.sleep(5)
 
 
+# ─── Paper trading helpers ───────────────────────────────────
+async def handle_paper_command(session: aiohttp.ClientSession):
+    if not PAPER_MODE:
+        await send_tg("Paper mode désactivé (PAPER_MODE=false)")
+        return
+    bal   = paper_state["usdc_balance"]
+    ini   = paper_state["initial_balance"]
+    total = paper_state["total_trades"]
+    wins  = paper_state["wins"]
+    wr    = (wins / total * 100) if total > 0 else 0.0
+    rpnl  = paper_state["total_pnl"]
+
+    lines = [
+        "📄 PAPER TRADING — Rapport\n",
+        f"Solde USDC  : {bal:.2f} USDC",
+        f"Initial     : {ini:.2f} USDC",
+        f"P&L réalisé : {rpnl:+.2f} USDC",
+        f"Trades      : {total} | Win rate : {wr:.0f}%\n",
+    ]
+    if positions:
+        lines.append("Positions ouvertes :")
+        for mint, pos in list(positions.items()):
+            current = await get_token_price_usd(session, mint)
+            entry   = pos.get("entry_price", 0)
+            pct     = (current - entry) / entry * 100 if entry > 0 else 0
+            lines.append(f"  {pos.get('symbol','?')}: {pct:+.1f}% | entrée ${entry:.6f}")
+    else:
+        lines.append("Aucune position ouverte.")
+    await send_tg("\n".join(lines))
+
+
+async def telegram_commands_loop():
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        return
+    url    = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    offset = 0
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, params={"timeout": 1}, timeout=aiohttp.ClientTimeout(total=5)) as r:
+                data = await r.json(content_type=None)
+            for upd in data.get("result", []):
+                offset = upd["update_id"] + 1
+    except Exception:
+        pass
+    while True:
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(
+                    url, params={"timeout": 20, "offset": offset},
+                    timeout=aiohttp.ClientTimeout(total=25),
+                ) as r:
+                    data = await r.json(content_type=None)
+                for upd in data.get("result", []):
+                    offset = upd["update_id"] + 1
+                    msg  = upd.get("message", {})
+                    text = (msg.get("text") or "").strip()
+                    cid  = str(msg.get("chat", {}).get("id", ""))
+                    if cid == CHAT_ID and text.startswith("/paper"):
+                        await handle_paper_command(s)
+        except Exception as e:
+            logger.error(f"telegram_commands_loop: {e}")
+            await asyncio.sleep(5)
+
+
 # ─── Watchdog ────────────────────────────────────────────────
 async def watchdog_loop():
     while True:
@@ -1231,6 +1358,7 @@ async def main():
         telethon_loop(),
         watchdog_loop(),
         pumpfun_ws_loop(),
+        telegram_commands_loop(),
     )
 
 
