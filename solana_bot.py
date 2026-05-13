@@ -60,13 +60,13 @@ _JUP_ENDPOINTS = [
     "https://api.jup.ag/swap/v1",
 ]
 _JUP_BASE: str = _JUP_ENDPOINTS[0]
-STOP_LOSS_PCT   = -30.0
-TP_HALF_PCT     = 50.0      # vendre 50% à +50%
-TP_FULL_PCT     = 100.0     # vendre 100% à +100%
-TRAILING_PCT    = 25.0      # trailing -25% depuis le pic (actif si pic >= +50%)
+STOP_LOSS_PCT   = -10.0
+TP_HALF_PCT     = 10.0      # vendre 50% à +10%
+TP_FULL_PCT     = 25.0      # vendre 100% à +25%
+TRAILING_PCT    = 7.0       # trailing -7% depuis le pic (actif si pic >= +5%)
 
 SCAN_INTERVAL    = 20
-MONITOR_INTERVAL = 30
+MONITOR_INTERVAL = 10
 PYRAMID_INTERVAL = 300
 
 CHANNELS = [
@@ -96,8 +96,8 @@ positions    = {}   # mint -> dict
 blacklist    = {}   # mint -> datetime d'expiration
 tg_mentions  = defaultdict(lambda: defaultdict(list))  # mint -> channel -> [datetime]
 
-POSITIONS_FILE = "solana_positions.json"
-BLACKLIST_FILE  = "solana_blacklist.json"
+POSITIONS_FILE = "/root/solana_positions.json"
+BLACKLIST_FILE  = "/root/solana_blacklist.json"
 
 
 def _load_state():
@@ -499,6 +499,9 @@ async def jupiter_sell(session: aiohttp.ClientSession, mint: str, qty_raw: int) 
     quote = await _jup_quote(session, quote_url)
     if not quote:
         return False, "quote vente échoué (voir logs)", 0.0
+    if quote == "NO_ROUTES_FOUND":
+        logger.warning(f"jupiter_sell {mint[:8]}: NO_ROUTES_FOUND — liquidité absente, vente impossible")
+        return False, "NO_ROUTES_FOUND — liquidité absente, vente impossible", 0.0
     if "error" in quote:
         logger.error(f"jupiter_sell: erreur Jupiter quote: {quote['error']}")
         return False, f"quote error: {quote['error']}", 0.0
@@ -588,9 +591,176 @@ async def get_token_price_usd(session: aiohttp.ClientSession, mint: str) -> floa
     return float(pair.get("priceUsd", 0) or 0)
 
 
+async def get_real_qty(session: aiohttp.ClientSession, mint: str) -> int:
+    """Retourne la vraie quantité détenue via getTokenAccountsByOwner."""
+    kp = get_keypair()
+    if not kp:
+        return 0
+    payload = {
+        "jsonrpc": "2.0", "id": 1,
+        "method":  "getTokenAccountsByOwner",
+        "params":  [str(kp.pubkey()), {"mint": mint}, {"encoding": "jsonParsed"}],
+    }
+    try:
+        async with session.post(HELIUS_RPC_URL, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            data = await r.json(content_type=None)
+        accounts = data.get("result", {}).get("value") or []
+        total = 0
+        for acct in accounts:
+            amt = (acct.get("account", {}).get("data", {})
+                       .get("parsed", {}).get("info", {})
+                       .get("tokenAmount", {}).get("amount"))
+            if amt:
+                total += int(amt)
+        return total
+    except Exception as e:
+        logger.error(f"get_real_qty {mint[:8]}: {e}")
+        return 0
+
+
+# ─── Pump.fun sell ───────────────────────────────────────────
+async def pump_sell(mint: str, qty_raw: int) -> tuple[bool, str, float]:
+    """Vend via PumpPortal Local Transaction API. Retourne (success, sig, usdc_estimé)."""
+    if DRY_RUN:
+        logger.info(f"[DRY RUN] Pump.fun vente simulée : {qty_raw} tokens de {mint[:8]}")
+        return True, "dry_run_sig", 2.0
+    kp = get_keypair()
+    if not kp:
+        return False, "keypair manquant", 0.0
+    try:
+        response = requests.post(url="https://pumpportal.fun/api/trade-local", data={
+            "publicKey":        str(kp.pubkey()),
+            "action":           "sell",
+            "mint":             mint,
+            "amount":           qty_raw,
+            "denominatedInSol": "false",
+            "slippage":         15,
+            "priorityFee":      0.01,
+            "pool":             "pump",
+        })
+        if response.status_code != 200:
+            logger.error(f"pump_sell: HTTP {response.status_code} — {response.text[:200]}")
+            return False, f"pump HTTP {response.status_code}", 0.0
+        from solders.transaction import VersionedTransaction
+        from solders.commitment_config import CommitmentLevel
+        from solders.rpc.requests import SendVersionedTransaction
+        from solders.rpc.config import RpcSendTransactionConfig
+        tx = VersionedTransaction(VersionedTransaction.from_bytes(response.content).message, [kp])
+        commitment = CommitmentLevel.Confirmed
+        config = RpcSendTransactionConfig(preflight_commitment=commitment)
+        rpc_response = requests.post(
+            url=HELIUS_RPC_URL,
+            headers={"Content-Type": "application/json"},
+            data=SendVersionedTransaction(tx, config).to_json(),
+        )
+        rpc_json = rpc_response.json()
+        if "result" not in rpc_json:
+            logger.error(f"pump_sell RPC erreur: {rpc_json}")
+            return False, f"RPC erreur: {rpc_json.get('error', rpc_json)}", 0.0
+        sig = rpc_json["result"]
+        logger.info(f"pump_sell {mint[:8]} sig={sig[:12]}")
+        return True, sig, 0.0
+    except Exception as e:
+        logger.error(f"pump_sell: {e}")
+        return False, str(e), 0.0
+
+
+async def smart_sell(
+    session: aiohttp.ClientSession,
+    mint: str,
+    qty_raw: int,
+    symbol: str,
+    pct_e: float,
+    opened_at: str,
+) -> tuple[bool, str, float]:
+    """Vente avec fallback progressif. Retourne (success, sig, usdc)."""
+    is_pump = mint.endswith("pump")
+    kp = get_keypair()
+    if not kp:
+        return False, "keypair manquant", 0.0
+
+    # 1. Tokens pump.fun natifs : pump_sell en priorité
+    if is_pump:
+        ok, sig, usdc = await pump_sell(mint, qty_raw)
+        if ok:
+            return ok, sig, usdc
+        logger.warning(f"smart_sell {mint[:8]}: pump_sell échoué — fallback Jupiter")
+
+    # 2. Jupiter avec slippage progressif
+    for slippage in [SLIPPAGE_BPS, 3000, 5000, 9900]:
+        quote_url = (
+            f"{_JUP_BASE}/quote"
+            f"?inputMint={mint}&outputMint={USDC_MINT}"
+            f"&amount={qty_raw}&slippageBps={slippage}"
+            f"&maxAccounts=20"
+        )
+        logger.info(f"smart_sell {mint[:8]}: Jupiter slippage={slippage}bps")
+        quote = await _jup_quote(session, quote_url)
+        if not quote or quote == "NO_ROUTES_FOUND":
+            logger.warning(f"smart_sell {mint[:8]}: NO_ROUTES_FOUND à {slippage}bps")
+            continue
+        if "error" in quote:
+            logger.warning(f"smart_sell {mint[:8]}: quote error {quote['error']} à {slippage}bps")
+            continue
+        swap = await _jup_swap(session, {
+            "quoteResponse":    quote,
+            "userPublicKey":    str(kp.pubkey()),
+            "wrapAndUnwrapSol": True,
+            "jitoTipLamports":  JITO_TIP_LAMPORTS,
+        })
+        if not swap or "swapTransaction" not in swap:
+            logger.warning(f"smart_sell {mint[:8]}: swapTransaction absent à {slippage}bps")
+            continue
+        try:
+            from solders.transaction import VersionedTransaction
+            from solana.rpc.async_api import AsyncClient
+            raw    = base64.b64decode(swap["swapTransaction"])
+            tx     = VersionedTransaction.from_bytes(raw)
+            signed = VersionedTransaction(tx.message, [kp])
+            async with AsyncClient(HELIUS_RPC_URL) as client:
+                result = await asyncio.wait_for(client.send_raw_transaction(bytes(signed)), timeout=30)
+            sig  = str(result.value)
+            usdc = int(quote.get("outAmount", 0)) / 10**USDC_DECIMALS
+            logger.info(f"smart_sell OK {mint[:8]} slippage={slippage}bps usdc={usdc:.2f} sig={sig[:12]}")
+            return True, sig, usdc
+        except asyncio.TimeoutError:
+            logger.error(f"smart_sell {mint[:8]} timeout RPC à {slippage}bps")
+            continue
+        except Exception as e:
+            logger.error(f"smart_sell {mint[:8]} sign/send {slippage}bps: {e}")
+            continue
+
+    # 3. Pump.fun fallback pour tokens non-pump
+    if not is_pump:
+        ok, sig, usdc = await pump_sell(mint, qty_raw)
+        if ok:
+            return ok, sig, usdc
+        logger.error(f"smart_sell {mint[:8]}: pump_sell fallback aussi échoué")
+
+    # 4. Tout a échoué — alerte Telegram
+    try:
+        opened_dt = datetime.fromisoformat(opened_at)
+        age_min = (datetime.now(timezone.utc).replace(tzinfo=None) - opened_dt).total_seconds() / 60
+    except Exception:
+        age_min = 0
+    await send_tg(
+        f"⚠️ VENTE BLOQUÉE {symbol}\n"
+        f"Liquidité absente depuis {age_min:.0f} minutes.\n"
+        f"Prix actuel : {pct_e:+.1f}% vs entrée.\n"
+        f"Vends manuellement !"
+    )
+    return False, "toutes tentatives échouées", 0.0
+
+
 # ─── Gestion de position ──────────────────────────────────────
-def open_pos(mint: str, symbol: str, amount_usdc: float, entry_price: float,
-             qty_raw: int, score: int, reasons: str, sig: str):
+async def open_pos(session: aiohttp.ClientSession, mint: str, symbol: str,
+                   amount_usdc: float, entry_price: float,
+                   qty_raw: int, score: int, reasons: str, sig: str):
+    if not symbol or symbol == "?":
+        pair = await fetch_dexscreener_pair(session, mint)
+        symbol = (pair or {}).get("baseToken", {}).get("symbol", "") or ""
+    if not symbol or symbol == "?":
+        symbol = mint[:6]
     positions[mint] = {
         "mint":          mint,
         "symbol":        symbol,
@@ -626,20 +796,23 @@ async def check_position(session: aiohttp.ClientSession, mint: str):
 
     entry  = pos["entry_price"]
     peak   = pos["peak_price"]
-    qty    = pos["qty_raw"]
     symbol = pos["symbol"]
     pct_e  = (current - entry) / entry * 100
     pct_p  = (current - peak) / peak * 100
+    real_qty = await get_real_qty(session, mint)
+    qty      = real_qty if real_qty > 0 else pos["qty_raw"]
 
     if current > peak:
         positions[mint]["peak_price"] = current
         _save_state()
         peak = current
 
-    # Take profit partiel +50% → vendre 50%
+    opened_at = pos.get("opened_at", "")
+
+    # Take profit partiel → vendre 50%
     if not pos["half_sold"] and pct_e >= TP_HALF_PCT:
         half = qty // 2
-        ok, sig, usdc = await jupiter_sell(session, mint, half)
+        ok, sig, usdc = await smart_sell(session, mint, half, symbol, pct_e, opened_at)
         if ok:
             pnl = usdc - pos["amount_usdc"] * 0.5
             positions[mint]["half_sold"]  = True
@@ -655,9 +828,9 @@ async def check_position(session: aiohttp.ClientSession, mint: str):
             )
         return
 
-    # Take profit total +100%
+    # Take profit total
     if pct_e >= TP_FULL_PCT:
-        ok, sig, usdc = await jupiter_sell(session, mint, qty)
+        ok, sig, usdc = await smart_sell(session, mint, qty, symbol, pct_e, opened_at)
         if ok:
             pnl = usdc - pos["amount_usdc"]
             await send_tg(
@@ -670,10 +843,10 @@ async def check_position(session: aiohttp.ClientSession, mint: str):
             close_pos(mint)
         return
 
-    # Trailing stop −25% depuis le pic (actif seulement si pic a dépassé +50%)
+    # Trailing stop −7% depuis le pic (actif dès que pic >= +5%)
     peak_pct_entry = (peak - entry) / entry * 100
-    if peak_pct_entry >= TP_HALF_PCT and pct_p <= -TRAILING_PCT:
-        ok, sig, usdc = await jupiter_sell(session, mint, qty)
+    if peak_pct_entry >= 5.0 and pct_p <= -TRAILING_PCT:
+        ok, sig, usdc = await smart_sell(session, mint, qty, symbol, pct_e, opened_at)
         if ok:
             pnl = usdc - pos["amount_usdc"]
             await send_tg(
@@ -686,9 +859,9 @@ async def check_position(session: aiohttp.ClientSession, mint: str):
             close_pos(mint)
         return
 
-    # Stop loss −30%
+    # Stop loss
     if pct_e <= STOP_LOSS_PCT:
-        ok, sig, usdc = await jupiter_sell(session, mint, qty)
+        ok, sig, usdc = await smart_sell(session, mint, qty, symbol, pct_e, opened_at)
         if ok:
             pnl = usdc - pos["amount_usdc"]
             await send_tg(
@@ -812,7 +985,7 @@ async def process_token(session: aiohttp.ClientSession, mint: str,
     entry_price = float((pair or {}).get("priceUsd", 0) or 0)
     if entry_price <= 0:
         entry_price = TRADE_USDC / (qty_raw / 10**6) if qty_raw > 0 else 0
-    open_pos(mint, symbol, TRADE_USDC, entry_price, qty_raw, score, reasons, sig)
+    await open_pos(session, mint, symbol, TRADE_USDC, entry_price, qty_raw, score, reasons, sig)
 
     await send_tg(
         f"SOLANA ACHAT\n\n"
@@ -944,11 +1117,11 @@ async def telethon_loop():
 # ─── Pump.fun WebSocket (détection instantanée) ──────────────
 async def pumpfun_ws_loop():
     import websockets
-    uri = "wss://frontend-api.pump.fun/"
+    uri = "wss://pumpportal.fun/api/data"
     while True:
         try:
             async with websockets.connect(uri, ping_interval=20) as ws:
-                await ws.send(json.dumps({"method": "subscribeNewToken"}))
+                await ws.send(json.dumps({"method": "subscribeNewTokenTrade"}))
                 logger.info("pumpfun_ws: connecté — écoute nouveaux tokens en temps réel")
                 async with aiohttp.ClientSession() as session:
                     async for raw_msg in ws:
