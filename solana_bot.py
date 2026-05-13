@@ -394,6 +394,9 @@ async def _jup_quote(session: aiohttp.ClientSession, url: str) -> dict | None:
                 if "NO_ROUTES_FOUND" in body:
                     logger.info(f"Jupiter NO_ROUTES_FOUND — essai pump.fun")
                     return "NO_ROUTES_FOUND"
+                if r.status == 429:
+                    logger.warning(f"Jupiter quote 429 rate limit")
+                    return "RATE_LIMITED"
                 logger.error(
                     f"Jupiter quote HTTP {r.status}\n"
                     f"  URL  : {url}\n"
@@ -687,7 +690,9 @@ async def smart_sell(
         logger.warning(f"smart_sell {mint[:8]}: pump_sell échoué — fallback Jupiter")
 
     # 2. Jupiter avec slippage progressif
-    for slippage in [SLIPPAGE_BPS, 3000, 5000, 9900]:
+    for i, slippage in enumerate([SLIPPAGE_BPS, 3000, 5000, 9900]):
+        if i > 0:
+            await asyncio.sleep(2)
         quote_url = (
             f"{_JUP_BASE}/quote"
             f"?inputMint={mint}&outputMint={USDC_MINT}"
@@ -696,8 +701,12 @@ async def smart_sell(
         )
         logger.info(f"smart_sell {mint[:8]}: Jupiter slippage={slippage}bps")
         quote = await _jup_quote(session, quote_url)
-        if not quote or quote == "NO_ROUTES_FOUND":
-            logger.warning(f"smart_sell {mint[:8]}: NO_ROUTES_FOUND à {slippage}bps")
+        if quote == "RATE_LIMITED":
+            logger.warning(f"smart_sell {mint[:8]}: 429 à {slippage}bps — attente 10s avant retry")
+            await asyncio.sleep(10)
+            quote = await _jup_quote(session, quote_url)
+        if not quote or quote == "NO_ROUTES_FOUND" or quote == "RATE_LIMITED":
+            logger.warning(f"smart_sell {mint[:8]}: échec quote à {slippage}bps ({quote!r})")
             continue
         if "error" in quote:
             logger.warning(f"smart_sell {mint[:8]}: quote error {quote['error']} à {slippage}bps")
